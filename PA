@@ -1,0 +1,184 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+"""
+***********************************************************************************************************************
+                                    utiles.buscar_directorio_empresas.py
+
+Conjunto de clases y funciones para obtener un listado de webs de empresas españolas
+
+Autor: Jon Company Martin
+Fecha de creacion: 2016-07-27
+Ultima fecha de actualizacion: 2016-07-27
+***********************************************************************************************************************
+"""
+
+import os, ConfigParser, logging, time, random
+from datetime import datetime
+import clog, dbconnect
+import scrapy
+from scrapy.http import Request
+from scrapy.xlib.pydispatch import dispatcher
+from scrapy import signals
+from scrapy.utils.log import configure_logging
+from scrapy.crawler import CrawlerProcess
+
+def cargar_lista_user_agents(conf, db):
+    db.dbcursor.execute('SELECT DISTINCT NOMBRE FROM %s' % conf.get('datos_tablas', 'TABLA_USER_AGENTS'))
+    return [nombre[0] for nombre in db.dbcursor if nombre]
+
+class SpiderElEconomista(scrapy.Spider):
+    """
+    El spider se conecta a http://ranking-empresas.eleconomista.es/ y saca el ranking provincial de empresas por
+    facturacion.
+    """
+    name = 'spider_el_economista'
+    allowed_domains = ['http://eleconomista.es']
+
+class SpiderInfobel(scrapy.Spider):
+    """
+    El spider se conecta a http://www.infobel.com/es/spain y saca todas las empresas.
+    """
+    name = 'spider_infobel'
+    allowed_domains = [' http://www.infobel.com']
+
+class SpiderExpansion(scrapy.Spider):
+    """
+    El spider se conecta a http://www.expansion.com/directorio-empresas.html y saca todas las empresas por actividad.
+    """
+
+class SpiderAxesor(scrapy.Spider):
+    """
+    El spider se conecta a https://www.axesor.es/directorio-informacion-empresas
+    y saca todas las empresas por situacion geografica
+    """
+
+class SpiderCategoriasPaginasAmarillas(scrapy.Spider):
+    """
+    El spider se conecta a http://www.paginasamarillas.es/diraz/a/ y recorre todas las categorias.
+    Guarda en una tabla las urls de todas las categorias finales.
+    """
+    name = 'spider_categorias_paginas_amarillas'
+    allowed_domains = [' http://www.paginasamarillas.es']
+
+
+
+    def __init__(self, **kwargs):
+         # parsear fichero de configuracion
+        utiles = os.path.dirname(os.path.abspath(__file__))
+        etc = utiles.replace('utiles', 'etc')
+        conf = ConfigParser.ConfigParser()
+        conf.readfp(open('%s/config.cfg' % etc))
+
+        self.conf = conf
+        self.db = dbconnect.Dbconnect(self.conf)
+        dispatcher.connect(self.spider_closed, signals.spider_closed)
+        self.fecha_proceso = datetime.now().strftime('%Y%m%d')
+
+        nombrelog = self.conf.get('rutas_nuevas', 'RUTA_LOGS') + __name__
+        configure_logging(settings = {'LOG_FILE': '%s_DEBUG.log' % nombrelog, 'LOG_LEVEL': logging.DEBUG},
+                          install_root_handler = True)
+        configure_logging(settings = {'LOG_FILE': '%s_INFO.log' % nombrelog, 'LOG_LEVEL': logging.INFO},
+                          install_root_handler = True)
+
+        self.lista_user_agents = cargar_lista_user_agents(self.conf, self.db)
+        logging.info('Lista de %s user agents cargada.' % len(self.lista_user_agents))
+
+        letras = u'ABCDEFGHIJKLMNÑOPQRSTUVWXYZ'
+        self.urls_iniciales = ['http://www.paginasamarillas.es/diraz/%s/' % letra for letra in letras]
+
+        self.download_timeout = self.conf.getint('request', 'download_timeout')
+
+        super(SpiderCategoriasPaginasAmarillas, self).__init__(**kwargs)
+
+    def spider_closed(self, spider):
+        self.db.commit_db()
+        self.db.cerrar_db()
+
+    def start_requests(self):
+        for url in self.urls_iniciales:
+            time.sleep(random.randint(8,10) + random.random())
+            yield Request(url, callback=self.parse,
+                          headers={'User-Agent': random.choice(self.lista_user_agents)})
+
+    def parse(self, response):
+        """
+        parse es llamado una vez por cada letra del directorio. Empieza en el primer listado de categorias.
+        """
+
+        selector = scrapy.Selector(response)
+        time.sleep(random.randint(5,6) + random.random())
+        categorias_primer_nivel = selector.xpath('//ul[@class="ulactividades"]/li/a/@href').extract()
+
+        if not categorias_primer_nivel:
+            logging.warning('No tiene ninguna categoria inicial. %s' % response.url)
+        else:
+            for categoria in categorias_primer_nivel:
+                time.sleep(random.randint(10,15) + random.random())
+                yield Request(categoria, callback=self.bajar_nivel,
+                              headers={'User-Agent': random.choice(self.lista_user_agents), 'Referer': response.url},
+                              meta={'download_timeout': self.download_timeout,
+                                    'handle_httpstatus_all': True,
+                                    'dont_redirect':True})
+
+    def bajar_nivel(self, response):
+        """
+        Baja un nivel y comprueba si hay mas categorias a las que bajar.
+        """
+        selector = scrapy.Selector(response)
+        time.sleep(random.randint(8,12) + random.random())
+        mas_categorias = selector.xpath('//ul[@class="ulactividades"]/li/a/@href').extract()
+
+        if not mas_categorias:
+            nombre_categoria = selector.xpath('//div[@class="m-results--title"]/h1/text()').extract()
+            if not nombre_categoria:
+                nombre_categoria = 'No encontrada'
+            num_resultados = selector.xpath('//span[@class="m-header--count"]/text()').extract()
+            if num_resultados:
+                try:
+                    num_resultados = int(num_resultados.replace(' resultados', ''))
+                except Exception as e:
+                    print 'num_resultados: %s.' % num_resultados
+                    num_resultados = 0
+            else:
+                num_resultados = 0
+            self.db.dbcursor.execute('INSERT INTO %s '
+                                     '(URL, CATEGORIA, NUM_RESULTADOS, EXTRAIDA, FECHA_EXTRACCION) '
+                                     'VALUES ("%s", "%s", %s, %s, "%s")'
+                                     % (self.conf.get('datos_tablas', 'TABLA_CATEGORIAS_PAGINAS_AMARILLAS'),
+                                        response.url, nombre_categoria, num_resultados, 0,
+                                        datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+            time.sleep(random.randint(6,10) + random.random())
+        else:
+            random.randint(9,13) + random.random()
+            for categoria in mas_categorias:
+                random.randint(11,16) + random.random()
+                yield Request(categoria, callback=self.bajar_nivel,
+                              headers={'User-Agent': random.choice(self.lista_user_agents), 'Referer': response.url},
+                              meta={'download_timeout': self.download_timeout,
+                                    'handle_httpstatus_all': True,
+                                    'dont_redirect':True})
+
+
+if __name__ == '__main__':
+
+    utiles = os.path.dirname(os.path.abspath(__file__))
+    etc = utiles.replace('utiles', 'etc')
+    conf = ConfigParser.ConfigParser()
+    conf.readfp(open(etc + '/config.cfg'))
+    ilog = clog.Clog(conf, ['%s_DEBUG.log' % __file__.replace('.py', '')])
+    log = ilog.logger
+
+    try:
+        log.info('//////////// Inicio del script %s /////////////' % __file__)
+        log.info('//////////// Comenzando a descargar informacion de las fuentes de informacion ...')
+        log.info('//////////// Se lanza SpiderCategoriasPaginasAmarillas...')
+
+        proceso = CrawlerProcess()
+        proceso.crawl(SpiderCategoriasPaginasAmarillas)
+        proceso.start()
+
+
+    except Exception as e:
+        log.exception('Error durante la ejecucion del script %s. Saliendo del programa. %s %s'
+                      % (__file__, e, e.__class__))
+        raise
